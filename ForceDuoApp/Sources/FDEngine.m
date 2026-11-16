@@ -267,23 +267,58 @@ static NSString *lsdContainerCaches(uint64_t kind) {
     return [path stringByAppendingPathComponent:@"Library/Caches"];
 }
 
+// Independently implemented discovery using WQFiles' newest-inode-first strategy.
+// Reference: kolbicz/WQFiles, WQAccess.m (df5b830). No database writes here.
 static NSArray<NSString *> *inodeScanStoreDirectories(NSMutableString *log) {
-    struct statfs volume;
-    if (statfs(NSHomeDirectory().fileSystemRepresentation, &volume) != 0) return @[];
-    NSMutableOrderedSet *dirs = [NSMutableOrderedSet orderedSet];
+    NSString *probe = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                       [@"fd-inode-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+    int fd = open(probe.fileSystemRepresentation, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        [log appendFormat:@"Inode probe failed (errno %d).\n", errno];
+        return @[];
+    }
+    struct stat st = {0};
+    struct statfs volume = {0};
+    BOOL valid = fstat(fd, &st) == 0 && fstatfs(fd, &volume) == 0;
+    int probeError = errno;
+    close(fd);
+    unlink(probe.fileSystemRepresentation);
+    if (!valid || !st.st_ino || (uint64_t)st.st_ino > UINT64_MAX - 100000) {
+        [log appendFormat:@"Inode probe failed (errno %d).\n", probeError];
+        return @[];
+    }
+    // A freshly allocated APFS inode is a useful estimate, not a guaranteed maximum.
+    // Do not call a bounded search miss an access denial or an exhaustive scan.
+    uint64_t upper = (uint64_t)st.st_ino + 100000;
+    uint64_t inode = upper, checked = 0;
     char path[PATH_MAX];
     NSTimeInterval start = NSProcessInfo.processInfo.systemUptime;
-    unsigned inode = 16;
-    for (; inode <= 40000000; ++inode) {
-        if ((inode & 4095) == 0 && NSProcessInfo.processInfo.systemUptime - start > 20.0) break;
+    [log appendFormat:@"Reverse inode scan: probe %llu, estimated upper %llu.\n",
+        (unsigned long long)st.st_ino, (unsigned long long)upper];
+    for (; inode > 0; --inode) {
+        if ((checked & 1023) == 0 && NSProcessInfo.processInfo.systemUptime - start >= 20.0) break;
+        ++checked;
         if (fsgetpath(path, sizeof(path), &volume.f_fsid, inode) <= 0) continue;
-        if (!strstr(path, "LaunchServices-") || !strstr(path, "-v2.csstore")) continue;
-        NSString *match = [NSString stringWithUTF8String:path];
-        if ([match hasPrefix:@"/var/"]) match = [@"/private" stringByAppendingString:match];
-        if (isActiveStoreName(match.lastPathComponent)) [dirs addObject:match.stringByDeletingLastPathComponent];
+        if (!strstr(path, "com.apple.LaunchServices-") || !strstr(path, "-v2.csstore")) continue;
+        @autoreleasepool {
+            NSString *match = [NSString stringWithUTF8String:path];
+            if ([match hasPrefix:@"/var/"]) match = [@"/private" stringByAppendingString:match];
+            if (!isActiveStoreName(match.lastPathComponent)) continue;
+            if (!([match hasPrefix:@"/private/var/mobile/Containers/Data/InternalDaemon/"] ||
+                  [match hasPrefix:@"/private/var/containers/Data/System/"] ||
+                  [match hasPrefix:@"/private/var/db/lsd/"])) continue;
+            [log appendFormat:@"Reverse scan found %@ at inode %llu after %llu checks (%.2f s).\n",
+                match, (unsigned long long)inode, (unsigned long long)checked,
+                NSProcessInfo.processInfo.systemUptime - start];
+            return @[match.stringByDeletingLastPathComponent];
+        }
     }
-    [log appendFormat:@"Inode scan up to %u: %lu directories.\n", inode, (unsigned long)dirs.count];
-    return dirs.array;
+    [log appendFormat:@"Reverse scan stopped at %llu after %llu checks (%.2f s); %@.\n",
+        (unsigned long long)inode, (unsigned long long)checked,
+        NSProcessInfo.processInfo.systemUptime - start,
+        inode ? @"time limit reached; search incomplete" :
+                @"estimated range searched; no matching cache"];
+    return @[];
 }
 
 // Directories of csstore files mapped into this process (LaunchServices maps the DB for clients).
@@ -458,7 +493,7 @@ static NSArray<NSString *> *mappedStoreDirectories(NSMutableString *log) {
         FDAccess *access = [self accessDirectory:directory];
         if (access) return [self rememberAccess:access];
     }
-    if (error) *error = fdError(NSLocalizedString(@"Could not find or open the LaunchServices cache (iOS refused access).", nil));
+    if (error) *error = fdError(NSLocalizedString(@"Could not locate or read the LaunchServices cache. See the log for search and access results.", nil));
     return nil;
 }
 
@@ -476,7 +511,17 @@ static NSArray<NSString *> *mappedStoreDirectories(NSMutableString *log) {
         return nil;
     }
     NSData *data = nil;
-    if (!fstat(fd, st) && S_ISREG(st->st_mode)) data = readAll(fd, kMaxStore);
+    if (!fstat(fd, st) && S_ISREG(st->st_mode) && st->st_size >= 0x64 && st->st_size <= kMaxStore) {
+        data = readAll(fd, kMaxStore);
+        struct stat after = {0};
+        if (fstat(fd, &after) || st->st_ino != after.st_ino || st->st_size != after.st_size ||
+            st->st_mtimespec.tv_sec != after.st_mtimespec.tv_sec ||
+            st->st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec || data.length != st->st_size) {
+            close(fd);
+            if (error) *error = fdError(NSLocalizedString(@"The cache changed while reading. Refresh and try again.", nil));
+            return nil;
+        }
+    }
     close(fd);
     if (data.length < 0x64 && error) *error = fdError(NSLocalizedString(@"The cache is empty or too large.", nil));
     return data.length >= 0x64 ? data : nil;
@@ -489,7 +534,7 @@ static NSArray<NSString *> *mappedStoreDirectories(NSMutableString *log) {
         [_log appendFormat:@"iOS %@, %@\n", NSProcessInfo.processInfo.operatingSystemVersionString, FDEngine.deviceModel];
         FDAccess *access = [self openStoreAccess:error];
         if (!access) return nil;
-        struct stat st;
+        struct stat st = {0};
         NSData *store = [self readStore:access stat:&st error:error];
         BOOL valid = store && fdStoreOpens(access.storePath, NULL);
         [access close];
@@ -662,7 +707,7 @@ static BOOL validTriple(NSArray *v) {
             [_log writeToFile:[folder stringByAppendingPathComponent:@"report.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
             return nil;
         }
-        struct stat st;
+        struct stat st = {0};
         NSData *store = [self readStore:access stat:&st error:error];
         NSError *openError = nil;
         BOOL valid = store && fdStoreOpens(access.storePath, &openError);
