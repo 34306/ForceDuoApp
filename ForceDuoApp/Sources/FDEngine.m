@@ -267,22 +267,31 @@ static NSString *lsdContainerCaches(uint64_t kind) {
     return [path stringByAppendingPathComponent:@"Library/Caches"];
 }
 
+static NSDictionary<NSString *, NSString *> *gLastInodeScanFiles;
+
 static NSArray<NSString *> *inodeScanStoreDirectories(NSMutableString *log) {
     struct statfs volume;
     if (statfs(NSHomeDirectory().fileSystemRepresentation, &volume) != 0) return @[];
     NSMutableOrderedSet *dirs = [NSMutableOrderedSet orderedSet];
+    NSMutableDictionary *files = [NSMutableDictionary dictionary];
     char path[PATH_MAX];
     NSTimeInterval start = NSProcessInfo.processInfo.systemUptime;
     unsigned inode = 16;
     for (; inode <= 40000000; ++inode) {
-        if ((inode & 4095) == 0 && NSProcessInfo.processInfo.systemUptime - start > 20.0) break;
+        if ((inode & 4095) == 0 && NSProcessInfo.processInfo.systemUptime - start > 75.0) break;
         if (fsgetpath(path, sizeof(path), &volume.f_fsid, inode) <= 0) continue;
         if (!strstr(path, "LaunchServices-") || !strstr(path, "-v2.csstore")) continue;
         NSString *match = [NSString stringWithUTF8String:path];
         if ([match hasPrefix:@"/var/"]) match = [@"/private" stringByAppendingString:match];
-        if (isActiveStoreName(match.lastPathComponent)) [dirs addObject:match.stringByDeletingLastPathComponent];
+        if (isActiveStoreName(match.lastPathComponent)) {
+            NSString *dir = match.stringByDeletingLastPathComponent;
+            [dirs addObject:dir];
+            files[dir] = match;
+        }
     }
-    [log appendFormat:@"Inode scan up to %u: %lu directories.\n", inode, (unsigned long)dirs.count];
+    gLastInodeScanFiles = [files copy];
+    [log appendFormat:@"Inode scan (extended, 75s budget) up to %u in %.0fs: %lu directories.\n", inode, NSProcessInfo.processInfo.systemUptime - start, (unsigned long)dirs.count];
+    for (NSString *dir in dirs) [log appendFormat:@"  inode-scan dir: %@ file: %@\n", dir, files[dir]];
     return dirs.array;
 }
 
@@ -414,6 +423,64 @@ static NSArray<NSString *> *mappedStoreDirectories(NSMutableString *log) {
     return access;
 }
 
+
+// Shared enumeration used by the fallback access routes: with a token already
+// consumed for an ancestor (or the file itself), open the Caches directory and
+// pick the newest active store in it.
+- (FDAccess *)accessWithConsumedToken:(int64_t)token directory:(NSString *)directory via:(NSString *)via {
+    if (token < 0) return nil;
+    int dir = open(directory.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir < 0) {
+        [_log appendFormat:@"    fallback %@ open dir errno %d for %@\n", via, errno, directory];
+        worse_query_release(token);
+        return nil;
+    }
+    NSArray *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:nil];
+    NSString *best = nil;
+    struct timespec bestTime = {0};
+    for (NSString *name in names) {
+        if (!isActiveStoreName(name)) continue;
+        struct stat st;
+        if (fstatat(dir, name.fileSystemRepresentation, &st, AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode)) continue;
+        [_log appendFormat:@"    fallback %@ found %@ (%lld bytes)\n", via, name, (long long)st.st_size];
+        if (!best || st.st_mtimespec.tv_sec > bestTime.tv_sec) { best = name; bestTime = st.st_mtimespec; }
+    }
+    if (!best) {
+        [_log appendFormat:@"    fallback %@ no active store in %@\n", via, directory];
+        close(dir);
+        worse_query_release(token);
+        return nil;
+    }
+    FDAccess *access = [FDAccess new];
+    access.token = token;
+    access.dir = dir;
+    access.directory = directory;
+    access.storeName = best;
+    return access;
+}
+
+// Fallback (b): token on the container root (<UUID> dir two levels up from
+// Library/Caches), then open the Caches subdir under that token.
+- (FDAccess *)accessDirectoryViaContainerRoot:(NSString *)directory {
+    NSString *containerRoot = directory.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
+    int64_t first = worse_query(containerRoot, FDAppGroup, false, true);
+    int64_t token = first;
+    int64_t alt = -9999;
+    if (token < 0) { alt = worse_query(containerRoot, FDAppGroup, true, true); token = alt; }
+    [_log appendFormat:@"  fallback-root %@ -> token %lld / alt %lld\n", containerRoot, first, alt];
+    return [self accessWithConsumedToken:token directory:directory via:@"root"];
+}
+
+// Fallback (c): token on the store file path itself, then open its directory.
+- (FDAccess *)accessStoreFile:(NSString *)filePath directory:(NSString *)directory {
+    int64_t first = worse_query(filePath, FDAppGroup, false, true);
+    int64_t token = first;
+    int64_t alt = -9999;
+    if (token < 0) { alt = worse_query(filePath, FDAppGroup, true, true); token = alt; }
+    [_log appendFormat:@"  fallback-file %@ -> token %lld / alt %lld\n", filePath, first, alt];
+    return [self accessWithConsumedToken:token directory:directory via:@"file"];
+}
+
 - (FDAccess *)openStoreAccess:(NSError **)error {
     NSMutableOrderedSet<NSString *> *candidates = [NSMutableOrderedSet orderedSet];
     NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:kStoreDirKey];
@@ -455,8 +522,17 @@ static NSArray<NSString *> *mappedStoreDirectories(NSMutableString *log) {
     }
     for (NSString *directory in inodeScanStoreDirectories(_log)) {
         if ([candidates containsObject:directory]) continue;
+        [candidates addObject:directory];
         FDAccess *access = [self accessDirectory:directory];
         if (access) return [self rememberAccess:access];
+        [_log appendFormat:@"  main access failed for %@, trying fallbacks\n", directory];
+        FDAccess *rootAccess = [self accessDirectoryViaContainerRoot:directory];
+        if (rootAccess) return [self rememberAccess:rootAccess];
+        NSString *filePath = gLastInodeScanFiles[directory];
+        if (filePath) {
+            FDAccess *fileAccess = [self accessStoreFile:filePath directory:directory];
+            if (fileAccess) return [self rememberAccess:fileAccess];
+        }
     }
     if (error) *error = fdError(NSLocalizedString(@"Could not find or open the LaunchServices cache (iOS refused access).", nil));
     return nil;
