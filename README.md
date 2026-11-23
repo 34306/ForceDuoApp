@@ -1,5 +1,5 @@
 # ForceDuoApp
-Force iPhone Duo's application use latest SDK to adaptive and supports iPhone Duo, normally it just fall back to iPad UI
+Force iPhone Duo's application use latest SDK to adaptive and supports iPhone Duo, normally it just falls back to iPad UI
 
 > [!WARNING]
 > worse_query got patched on 27.3 beta 2 so it won’t work anymore if you updated to 27.3b2. iOS 27.2.1 still safe!
