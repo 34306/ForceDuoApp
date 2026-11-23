@@ -62,3 +62,5 @@
 "Found the LaunchServices cache but iOS refused access to it (%@)." = "Found the LaunchServices cache but iOS refused access to it (%@).";
 "Could not locate the LaunchServices cache: the search timed out before reaching it." = "Could not locate the LaunchServices cache: the search timed out before reaching it.";
 "Could not locate the LaunchServices cache on this device." = "Could not locate the LaunchServices cache on this device.";
+"OK" = "OK";
+"Cache LaunchServices" = "Cache LaunchServices";
