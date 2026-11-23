@@ -62,3 +62,5 @@
 "Found the LaunchServices cache but iOS refused access to it (%@)." = "Đã tìm thấy cache LaunchServices nhưng iOS từ chối cấp quyền truy cập (%@).";
 "Could not locate the LaunchServices cache: the search timed out before reaching it." = "Không tìm thấy cache LaunchServices: quá thời gian tìm kiếm trước khi tới được nó.";
 "Could not locate the LaunchServices cache on this device." = "Không tìm thấy cache LaunchServices trên thiết bị này.";
+"OK" = "OK";
+"Cache LaunchServices" = "Bộ nhớ đệm LaunchServices";
